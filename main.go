@@ -1,11 +1,15 @@
-package function
+package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 
+	"cloud.google.com/go/firestore"
 	"github.com/slack-go/slack"
+	"github.com/yuuLab/slack-app-go.git/slackpoint"
 )
 
 var verificationToken string
@@ -44,35 +48,27 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(b)
 	case "/give_goodpoint":
-		params := &slack.Msg{ResponseType: "in_channel", Text: "只今メンテナンス中です...."}
-		b, err := json.Marshal(params)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+		recieverId, reason, err := slackpoint.ExtractRecieverIdAndReason(slashCommand.Text)
+		if err != nil || recieverId == "" || reason == "" {
+			http.Error(w, "Invalid input", http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(b)
-		// mention, reason, err := slackpoint.ExtractMentionAndReason(slashCommand.Text)
-		// if err != nil || mention == "" || reason == "" {
-		// 	http.Error(w, "Invalid input", http.StatusBadRequest)
-		// 	return
-		// }
-		// ctx := context.Background()
-		// client, err := firestore.NewClient(ctx, "good-point-dev")
-		// if err != nil {
-		// 	http.Error(w, "Error creating Firestore client", http.StatusInternalServerError)
-		// 	return
-		// }
-		// defer client.Close()
+		ctx := context.Background()
+		client, err := firestore.NewClient(ctx, "good-point-dev")
+		if err != nil {
+			http.Error(w, "Error creating Firestore client", http.StatusInternalServerError)
+			return
+		}
+		defer client.Close()
 
-		// err = slackpoint.GivePoint(ctx, client, slackpoint.SlackRequest{Sender: slashCommand.UserID, Reciever: mention, Reason: reason, Points: 1})
-		// if err != nil {
-		// 	http.Error(w, "Error giving point", http.StatusInternalServerError)
-		// 	return
-		// }
+		err = slackpoint.GivePoint(ctx, client, slackpoint.PointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1})
+		if err != nil {
+			http.Error(w, "Error giving point", http.StatusInternalServerError)
+			return
+		}
 
-		// response := fmt.Sprintf("Successfully gave 1 point to <@%s> for %s.", mention, reason)
-		// json.NewEncoder(w).Encode(map[string]string{"text": response})
+		response := fmt.Sprintf("<@%s>さんが<@%s>さんにイイねポイントを付与しました！ 付与理由： %s.", slashCommand.UserID, recieverId, reason)
+		json.NewEncoder(w).Encode(map[string]string{"text": response})
 	default:
 		w.WriteHeader(http.StatusInternalServerError)
 		return

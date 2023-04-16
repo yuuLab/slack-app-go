@@ -9,20 +9,23 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/firestore"
 	"github.com/slack-go/slack"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var verificationToken string
 
-// グローバル変数を定義して次回の関数呼び出し時にも再利用する。
-// references:https://cloud.google.com/functions/docs/bestpractices/tips#use_global_variables_to_reuse_objects_in_future_invocations
+// Define a global variable to be reused in the next function call.
+// reference:https://cloud.google.com/functions/docs/bestpractices/tips#use_global_variables_to_reuse_objects_in_future_invocations
 func init() {
 	verificationToken = os.Getenv("VERIFICATION_TOKEN")
 }
 
-// Entry point
+// CloudFunction entry point.
 func HandleCommand(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -64,13 +67,21 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 		}
 		defer client.Close()
 
-		err = givePoint(ctx, client, pointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1})
-		if err != nil {
+		pointTransaction := pointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+		if err := givePoint(ctx, client, pointTransaction); err != nil {
 			http.Error(w, "Error giving point", http.StatusInternalServerError)
 			return
 		}
 
-		params := &slack.Msg{ResponseType: "in_channel", Text: fmt.Sprintf("<@%s>さんが<@%s>さんにイイねポイントを付与しました！ 付与理由： %s.", slashCommand.UserID, recieverId, reason)}
+		point, err := saveUser(ctx, client, recieverId)
+		if err != nil {
+			http.Error(w, "Error saving point", http.StatusInternalServerError)
+			return
+		}
+
+		params := &slack.Msg{
+			ResponseType: "in_channel",
+			Text:         fmt.Sprintf("<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n【付与理由】\n %s \n【獲得ポイント数】\n %v pt", slashCommand.UserID, recieverId, reason, point)}
 		b, err := json.Marshal(params)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -78,6 +89,14 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(b)
+	case "/show_goodpoint_daily":
+		// TODO:
+	case "/show_goodpoint_weekly":
+		// TODO:
+	case "/show_goodpoint_monthly":
+		// TODO:
+	case "/show_goodpoint_ranking":
+		// TODO:
 	default:
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -110,6 +129,34 @@ func givePoint(ctx context.Context, client *firestore.Client, tran pointTran) er
 	return nil
 }
 
+func saveUser(ctx context.Context, client *firestore.Client, userId string) (int, error) {
+	ref := client.Collection("users").Doc(userId)
+	dsnap, err := ref.Get(ctx)
+	point := 0
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			point = 1
+		} else {
+			return 0, fmt.Errorf("failed to get user document: %v", err)
+		}
+	} else {
+		data := dsnap.Data()
+		p := data["points"]
+		// The type of the points retrieved from Firestore is `int64`.
+		pInt64, ok := p.(int64)
+		if !ok {
+			return 0, fmt.Errorf("failed to convert int64: %v", p)
+		}
+		point = int(pInt64) + 1
+	}
+	if _, err = ref.Set(ctx, map[string]interface{}{
+		"points": point,
+	}, firestore.MergeAll); err != nil {
+		return 0, err
+	}
+	return point, nil
+}
+
 func toMap(s interface{}) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	v := reflect.ValueOf(s)
@@ -130,9 +177,12 @@ func toMap(s interface{}) (map[string]interface{}, error) {
 	return result, nil
 }
 
+// point transaction
 type pointTran struct {
-	SenderId   string `firestore:"sender_id"`
-	RecieverId string `firestore:"reciever_id"`
-	Reason     string `firestore:"reason"`
-	Points     int8   `firestore:"points"`
+	SenderId   string    `firestore:"sender_id"`
+	RecieverId string    `firestore:"reciever_id"`
+	Reason     string    `firestore:"reason"`
+	Points     int       `firestore:"points"`
+	CreatedAt  time.Time `firestore:"created_at"`
+	UpdatedAt  time.Time `firestore:"updated_at"`
 }

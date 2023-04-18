@@ -1,6 +1,7 @@
 package slackapp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"cloud.google.com/go/firestore"
 	"github.com/slack-go/slack"
+	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -41,66 +43,126 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	message := ""
+	ctx := context.Background()
+	client, err := firestore.NewClient(ctx, "good-point-dev")
+	if err != nil {
+		http.Error(w, "Error creating Firestore client", http.StatusInternalServerError)
+		return
+	}
+	defer client.Close()
+
 	switch slashCommand.Command {
 	case "/hello":
-		// ResponseType のデフォルトは ephemeral になっており、ephemeral　では、投稿者にしかメッセージが表示されない。
-		// チャンネル全体に投稿する時は、in_channel を指定する。
-		params := &slack.Msg{ResponseType: "in_channel", Text: "こんにちは、<@" + slashCommand.UserID + ">さん。GoodPointアプリへようこそ！"}
-		b, err := json.Marshal(params)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(b)
+		message = "こんにちは、<@" + slashCommand.UserID + ">さん。GoodPointアプリへようこそ！"
 	case "/give_goodpoint":
 		recieverId, reason, err := extractRecieverIdAndReason(slashCommand.Text)
 		if err != nil || recieverId == "" || reason == "" {
 			http.Error(w, "Invalid input", http.StatusBadRequest)
 			return
 		}
-		ctx := context.Background()
-		client, err := firestore.NewClient(ctx, "good-point-dev")
-		if err != nil {
-			http.Error(w, "Error creating Firestore client", http.StatusInternalServerError)
-			return
-		}
-		defer client.Close()
-
+		// grant 1 pt to target user.
 		pointTransaction := pointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 		if err := givePoint(ctx, client, pointTransaction); err != nil {
 			http.Error(w, "Error giving point", http.StatusInternalServerError)
 			return
 		}
-
 		point, err := saveUser(ctx, client, recieverId)
 		if err != nil {
 			http.Error(w, "Error saving point", http.StatusInternalServerError)
 			return
 		}
-
-		params := &slack.Msg{
-			ResponseType: "in_channel",
-			Text:         fmt.Sprintf("<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n【付与理由】\n %s \n【獲得ポイント数】\n %v pt", slashCommand.UserID, recieverId, reason, point)}
-		b, err := json.Marshal(params)
+		message = fmt.Sprintf("<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n\n【付与理由】\n %s \n【獲得ポイント数】\n %v pt", slashCommand.UserID, recieverId, reason, point)
+	case "/show_goodpoint_monthly_history":
+		ptx, keys, err := inquirePointTran(ctx, client, startOfMonth())
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+			http.Error(w, "Error inquire monthly goddpoint transaction ", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(b)
-	case "/show_goodpoint_daily":
-		// TODO:
-	case "/show_goodpoint_weekly":
-		// TODO:
-	case "/show_goodpoint_monthly":
-		// TODO:
+		var bf bytes.Buffer
+		bf.WriteString("*****月間付与履歴*****\n")
+		for _, key := range keys {
+			tx := ptx[key]
+			bf.WriteString(fmt.Sprintf("%s  <@%s>さんから<@%s>さんへ付与。『%v』 （付与ID = %s）\n", toYyyymmdd(tx.CreatedAt), tx.SenderId, tx.RecieverId, tx.Reason, key))
+		}
+		message = bf.String()
 	case "/show_goodpoint_ranking":
-		// TODO:
+		limit := 10
+		rankings, err := inquireRanking(ctx, client, limit)
+		if err != nil {
+			http.Error(w, "Error inquire goddpoint ranking", http.StatusInternalServerError)
+			return
+		}
+		var bf bytes.Buffer
+		bf.WriteString("ランキング結果発表～～！\n\n")
+		for i, ranking := range rankings {
+			bf.WriteString(fmt.Sprintf("第%v位・・・<@%s>さん【獲得ポイント】%v pt \n", i+1, ranking.UserId, ranking.Points))
+		}
+		bf.WriteString("\n\n")
+		bf.WriteString("いつもありがとうございます！皆さん拍手をお送りください👏👏")
+		message = bf.String()
 	default:
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	// The default value for `ResponseType` is `ephemeral`, which means that the message will only be visible to the person who posted it.
+	// To post a message to the entire channel, specify `in_channel`.
+	params := &slack.Msg{
+		ResponseType: "in_channel",
+		Text:         message,
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
+}
+
+func inquireRanking(ctx context.Context, client *firestore.Client, limit int) ([]ranking, error) {
+	query := client.Collection("users").OrderBy("points", firestore.Desc).Limit(limit)
+	iter := query.Documents(ctx)
+	result := []ranking{}
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		data := doc.Data()
+		p := data["points"]
+		// The type of the points retrieved from Firestore is `int64`.
+		pInt64, ok := p.(int64)
+		if !ok {
+			return []ranking{}, fmt.Errorf("failed to convert int64: %v", p)
+		}
+		result = append(result, ranking{UserId: doc.Ref.ID, Points: int(pInt64)})
+	}
+	return result, nil
+}
+
+func inquirePointTran(ctx context.Context, client *firestore.Client, start time.Time) (pointTrans map[string]pointTran, sortedkeys []string, err error) {
+	query := client.Collection("pointTransactions").Where("created_at", ">=", start).OrderBy("created_at", firestore.Desc)
+	iter := query.Documents(ctx)
+	result := map[string]pointTran{}
+	sortedKeys := []string{}
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		var ptx pointTran
+		doc.DataTo(&ptx)
+		result[doc.Ref.ID] = ptx
+		sortedKeys = append(sortedKeys, doc.Ref.ID)
+	}
+	return result, sortedKeys, nil
 }
 
 func extractRecieverIdAndReason(text string) (string, string, error) {
@@ -177,6 +239,18 @@ func toMap(s interface{}) (map[string]interface{}, error) {
 	return result, nil
 }
 
+// Get the date and time of the first day of the current month, based on the system date and time.
+func startOfMonth() time.Time {
+	now := time.Now()
+	year, month, _ := now.Date()
+	return time.Date(year, month, 1, 0, 0, 0, 0, now.Location())
+}
+
+// Convert into `yyyy/mm/dd`
+func toYyyymmdd(t time.Time) string {
+	return t.Format("2006/01/02")
+}
+
 // point transaction
 type pointTran struct {
 	SenderId   string    `firestore:"sender_id"`
@@ -185,4 +259,9 @@ type pointTran struct {
 	Points     int       `firestore:"points"`
 	CreatedAt  time.Time `firestore:"created_at"`
 	UpdatedAt  time.Time `firestore:"updated_at"`
+}
+
+type ranking struct {
+	UserId string
+	Points int
 }

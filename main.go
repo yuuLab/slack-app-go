@@ -44,8 +44,10 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	message := ""
+	// Create firebase client.
 	ctx := context.Background()
 	client, err := firestore.NewClient(ctx, "good-point-dev")
+
 	if err != nil {
 		http.Error(w, "Error creating Firestore client", http.StatusInternalServerError)
 		return
@@ -54,27 +56,22 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 
 	switch slashCommand.Command {
 	case "/hello":
-		message = "こんにちは、<@" + slashCommand.UserID + ">さん。GoodPointアプリへようこそ！"
+		message = handleHello(slashCommand)
 	case "/give_goodpoint":
-		recieverId, reason, err := extractRecieverIdAndReason(slashCommand.Text)
-		if err != nil || recieverId == "" || reason == "" {
+		pointTrans, err := extractPointTransaction(slashCommand)
+		if err != nil || pointTrans.RecieverId == "" || pointTrans.Reason == "" {
 			http.Error(w, "Invalid input", http.StatusBadRequest)
 			return
 		}
-		// grant 1 pt to target user.
-		pointTransaction := pointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()}
-		if err := givePoint(ctx, client, pointTransaction); err != nil {
-			http.Error(w, "Error giving point", http.StatusInternalServerError)
+		if err := handleGiveGoodPoint(ctx, client, pointTrans); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		point, err := saveUser(ctx, client, recieverId)
-		if err != nil {
-			http.Error(w, "Error saving point", http.StatusInternalServerError)
-			return
-		}
-		message = fmt.Sprintf("<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n\n【付与理由】\n %s \n【獲得ポイント数】\n %v pt", slashCommand.UserID, recieverId, reason, point)
+		message = fmt.Sprintf(
+			"<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n\n【付与理由】\n %s \n【獲得ポイント数】\n %v pt",
+			slashCommand.UserID, pointTrans.RecieverId, pointTrans.Reason, pointTrans.Points+1)
 	case "/show_goodpoint_monthly_history":
-		ptx, keys, err := inquirePointTran(ctx, client, startOfMonth())
+		pointTrans, keys, err := inquirePointTran(ctx, client, startOfMonth())
 		if err != nil {
 			http.Error(w, "Error inquire monthly goddpoint transaction ", http.StatusInternalServerError)
 			return
@@ -82,7 +79,7 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 		var bf bytes.Buffer
 		bf.WriteString("*****月間付与履歴*****\n")
 		for _, key := range keys {
-			tx := ptx[key]
+			tx := pointTrans[key]
 			bf.WriteString(fmt.Sprintf("%s  <@%s>さんから<@%s>さんへ付与。『%v』 （付与ID = %s）\n", toYyyymmdd(tx.CreatedAt), tx.SenderId, tx.RecieverId, tx.Reason, key))
 		}
 		message = bf.String()
@@ -120,10 +117,25 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 }
 
-func inquireRanking(ctx context.Context, client *firestore.Client, limit int) ([]ranking, error) {
+func handleHello(slashCommand slack.SlashCommand) string {
+	return fmt.Sprintf("こんにちは、<@%s>さん。GoodPointアプリへようこそ！", slashCommand.UserID)
+}
+
+func handleGiveGoodPoint(ctx context.Context, client *firestore.Client, pointTrans pointTran) error {
+	// grant 1 pt to target user.
+	if err := givePoint(ctx, client, pointTrans); err != nil {
+		return fmt.Errorf("failed to give point")
+	}
+	if err := saveUser(ctx, client, pointTrans.RecieverId); err != nil {
+		return fmt.Errorf("failed to save point")
+	}
+	return nil
+}
+
+func inquireRanking(ctx context.Context, client *firestore.Client, limit int) ([]users, error) {
 	query := client.Collection("users").OrderBy("points", firestore.Desc).Limit(limit)
 	iter := query.Documents(ctx)
-	result := []ranking{}
+	result := []users{}
 	for {
 		doc, err := iter.Next()
 		if err == iterator.Done {
@@ -137,9 +149,9 @@ func inquireRanking(ctx context.Context, client *firestore.Client, limit int) ([
 		// The type of the points retrieved from Firestore is `int64`.
 		pInt64, ok := p.(int64)
 		if !ok {
-			return []ranking{}, fmt.Errorf("failed to convert int64: %v", p)
+			return []users{}, fmt.Errorf("failed to convert int64: %v", p)
 		}
-		result = append(result, ranking{UserId: doc.Ref.ID, Points: int(pInt64)})
+		result = append(result, users{UserId: doc.Ref.ID, Points: int(pInt64)})
 	}
 	return result, nil
 }
@@ -165,18 +177,18 @@ func inquirePointTran(ctx context.Context, client *firestore.Client, start time.
 	return result, sortedKeys, nil
 }
 
-func extractRecieverIdAndReason(text string) (string, string, error) {
-	// example : test = "<@U123456789|firstname.lastname> reasons"
+func extractPointTransaction(slashCommand slack.SlashCommand) (pointTran, error) {
+	// example:slashCommand.Text="<@U123456789|firstname.lastname> reasons"
 	re := regexp.MustCompile(`<@(U[A-Z0-9]+)\|[^>]+>`)
-	matches := re.FindStringSubmatch(text)
+	matches := re.FindStringSubmatch(slashCommand.Text)
 
 	if len(matches) < 2 {
-		return "", "", fmt.Errorf("failed to extract mention from text")
+		return pointTran{}, fmt.Errorf("failed to extract mention from text")
 	}
 
 	recieverId := matches[1]
-	reason := strings.TrimSpace(strings.Replace(text, matches[0], "", 1))
-	return recieverId, reason, nil
+	reason := strings.TrimSpace(strings.Replace(slashCommand.Text, matches[0], "", 1))
+	return pointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()}, nil
 }
 
 func givePoint(ctx context.Context, client *firestore.Client, tran pointTran) error {
@@ -191,7 +203,7 @@ func givePoint(ctx context.Context, client *firestore.Client, tran pointTran) er
 	return nil
 }
 
-func saveUser(ctx context.Context, client *firestore.Client, userId string) (int, error) {
+func saveUser(ctx context.Context, client *firestore.Client, userId string) error {
 	ref := client.Collection("users").Doc(userId)
 	dsnap, err := ref.Get(ctx)
 	point := 0
@@ -199,7 +211,7 @@ func saveUser(ctx context.Context, client *firestore.Client, userId string) (int
 		if status.Code(err) == codes.NotFound {
 			point = 1
 		} else {
-			return 0, fmt.Errorf("failed to get user document: %v", err)
+			return fmt.Errorf("failed to get user document: %v", err)
 		}
 	} else {
 		data := dsnap.Data()
@@ -207,18 +219,19 @@ func saveUser(ctx context.Context, client *firestore.Client, userId string) (int
 		// The type of the points retrieved from Firestore is `int64`.
 		pInt64, ok := p.(int64)
 		if !ok {
-			return 0, fmt.Errorf("failed to convert int64: %v", p)
+			return fmt.Errorf("failed to convert int64: %v", p)
 		}
 		point = int(pInt64) + 1
 	}
 	if _, err = ref.Set(ctx, map[string]interface{}{
 		"points": point,
 	}, firestore.MergeAll); err != nil {
-		return 0, err
+		return err
 	}
-	return point, nil
+	return nil
 }
 
+// Conver a struct into map.
 func toMap(s interface{}) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	v := reflect.ValueOf(s)
@@ -261,7 +274,7 @@ type pointTran struct {
 	UpdatedAt  time.Time `firestore:"updated_at"`
 }
 
-type ranking struct {
+type users struct {
 	UserId string
 	Points int
 }

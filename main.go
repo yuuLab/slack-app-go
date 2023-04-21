@@ -19,6 +19,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	COMMAND_HELP         string = "/help_goodpoint"
+	COMMAND_GIVE         string = "/give_goodpoint"
+	COMMAND_SHOW_HISTORY string = "/show_goodpoint_monthly_history"
+	COMMAND_SHOW_RANKING string = "/show_goodpoint_ranking"
+	COMMAND_DELETE       string = "/delete_goodpoint"
+)
+
 var verificationToken string
 
 // Define a global variable to be reused in the next function call.
@@ -55,49 +63,47 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 	defer client.Close()
 
 	switch slashCommand.Command {
-	case "/hello":
-		message = handleHello(slashCommand)
-	case "/give_goodpoint":
+	case COMMAND_HELP:
+		message = handleHelpGoodpoint(slashCommand)
+	case COMMAND_GIVE:
 		pointTrans, err := extractPointTransaction(slashCommand)
 		if err != nil || pointTrans.RecieverId == "" || pointTrans.Reason == "" {
 			http.Error(w, "Invalid input", http.StatusBadRequest)
 			return
 		}
-		if err := handleGiveGoodPoint(ctx, client, pointTrans); err != nil {
+		ms, err := handleGiveGoodPoint(ctx, client, pointTrans)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		message = fmt.Sprintf(
-			"<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n\n【付与理由】\n %s \n【獲得ポイント数】\n %v pt",
-			slashCommand.UserID, pointTrans.RecieverId, pointTrans.Reason, pointTrans.Points+1)
-	case "/show_goodpoint_monthly_history":
-		pointTrans, keys, err := inquirePointTran(ctx, client, startOfMonth())
+		message = ms
+	case COMMAND_SHOW_HISTORY:
+		ms, err := handleShowGoodpointHistory(ctx, client, startOfMonth())
 		if err != nil {
 			http.Error(w, "Error inquire monthly goddpoint transaction ", http.StatusInternalServerError)
 			return
 		}
-		var bf bytes.Buffer
-		bf.WriteString("*****月間付与履歴*****\n")
-		for _, key := range keys {
-			tx := pointTrans[key]
-			bf.WriteString(fmt.Sprintf("%s  <@%s>さんから<@%s>さんへ付与。『%v』 （付与ID = %s）\n", toYyyymmdd(tx.CreatedAt), tx.SenderId, tx.RecieverId, tx.Reason, key))
-		}
-		message = bf.String()
-	case "/show_goodpoint_ranking":
+		message = ms
+	case COMMAND_SHOW_RANKING:
 		limit := 10
-		rankings, err := inquireRanking(ctx, client, limit)
+		ms, err := handleShowRanking(ctx, client, limit)
 		if err != nil {
 			http.Error(w, "Error inquire goddpoint ranking", http.StatusInternalServerError)
 			return
 		}
-		var bf bytes.Buffer
-		bf.WriteString("ランキング結果発表～～！\n\n")
-		for i, ranking := range rankings {
-			bf.WriteString(fmt.Sprintf("第%v位・・・<@%s>さん【獲得ポイント】%v pt \n", i+1, ranking.UserId, ranking.Points))
+		message = ms
+	case COMMAND_DELETE:
+		ms, isInvalid, err := handleDeleteGoodPoint(ctx, client, slashCommand)
+		if err != nil {
+			http.Error(w, "Error inquire goddpoint ranking", http.StatusInternalServerError)
+			return
 		}
-		bf.WriteString("\n\n")
-		bf.WriteString("いつもありがとうございます！皆さん拍手をお送りください👏👏")
-		message = bf.String()
+		if isInvalid {
+			// slashcommandの値不正
+			http.Error(w, "Invalid input", http.StatusBadRequest)
+			return
+		}
+		message = ms
 	default:
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -117,64 +123,132 @@ func HandleCommand(w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 }
 
-func handleHello(slashCommand slack.SlashCommand) string {
-	return fmt.Sprintf("こんにちは、<@%s>さん。GoodPointアプリへようこそ！", slashCommand.UserID)
+// handle shash command `/hello_goodpoint`
+func handleHelpGoodpoint(slashCommand slack.SlashCommand) string {
+	var bf bytes.Buffer
+	bf.WriteString("`/help`    使用可能なコマンド一覧表示\n")
+	bf.WriteString("`/give_goodpoint @someone {give reasone}`  @someoneに対するいいねポイントの付与と理由。対象ユーザーに1ポイント付与されます。\n")
+	bf.WriteString("`/show_goodpoint_monthly_history`  当月のイイねポイント付与履歴一覧表示\n")
+	bf.WriteString("`/show_goodpoint_ranking`  これまでの総獲得いいねポイントのランキング表示\n")
+	return bf.String()
 }
 
-func handleGiveGoodPoint(ctx context.Context, client *firestore.Client, pointTrans pointTran) error {
+// handle shash command `/give_goodpoint`
+func handleGiveGoodPoint(ctx context.Context, client *firestore.Client, pointTrans pointTran) (string, error) {
 	// grant 1 pt to target user.
-	if err := givePoint(ctx, client, pointTrans); err != nil {
-		return fmt.Errorf("failed to give point")
+	if err := savePointTransaction(ctx, client, pointTrans); err != nil {
+		return "", fmt.Errorf("failed to give point")
 	}
-	if err := saveUser(ctx, client, pointTrans.RecieverId); err != nil {
-		return fmt.Errorf("failed to save point")
+	point, err := saveUserForGrant(ctx, client, pointTrans.RecieverId)
+	if err != nil {
+		return "", fmt.Errorf("failed to save point")
+	}
+	return fmt.Sprintf(
+		"<@%s>さんが<@%s>さんにイイねポイントを付与しました！ \n\n【付与理由】\n %s \n【獲得ポイント数】\n %v pt",
+		pointTrans.SenderId, pointTrans.RecieverId, pointTrans.Reason, point), nil
+}
+
+// handle slashcommand `/delete_goodpoint`
+func handleDeleteGoodPoint(ctx context.Context, client *firestore.Client, slashCommand slack.SlashCommand) (message string, isExisted bool, err error) {
+	isInvalidId := false
+	var targetTran pointTran
+	err = client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		// 削除対象の取得
+		ptxRef := client.Collection("pointTransactions").Doc(slashCommand.Text)
+		ptxDocSnap, err := tx.Get(ptxRef)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				isInvalidId = false
+				return nil
+			} else {
+				return fmt.Errorf("failed to get pointTransaction document: %v", err)
+			}
+		}
+		if err := ptxDocSnap.DataTo(&targetTran); err != nil {
+			return err
+		}
+		// 削除
+		if err := deleteDocument(ctx, client, "pointTransactions", slashCommand.Text); err != nil {
+			return err
+		}
+		// 削除対象のユーザーのポイント数を更新
+		userRef := client.Collection("users").Doc(targetTran.RecieverId)
+		userDocSnap, err := tx.Get(userRef)
+		if err != nil {
+			return fmt.Errorf("failed to get a user document when deleting a point transaction: %v", err)
+		}
+		var user user
+		if err := userDocSnap.DataTo(&user); err != nil {
+			return err
+		}
+		return createOrUpdateUser(ctx, userRef, user.Points-targetTran.Points)
+	})
+
+	return fmt.Sprintf(
+		"<@%s>さんが<@%s>さんへの付与を取り消しました。 \n\n【取消対象の付与理由】\n %s",
+		slashCommand.UserID, targetTran.RecieverId, targetTran.Reason), isInvalidId, err
+}
+
+func deleteDocument(ctx context.Context, client *firestore.Client, collectionName, documentID string) error {
+	docRef := client.Collection(collectionName).Doc(documentID)
+	_, err := docRef.Delete(ctx)
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func inquireRanking(ctx context.Context, client *firestore.Client, limit int) ([]users, error) {
-	query := client.Collection("users").OrderBy("points", firestore.Desc).Limit(limit)
-	iter := query.Documents(ctx)
-	result := []users{}
-	for {
-		doc, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		data := doc.Data()
-		p := data["points"]
-		// The type of the points retrieved from Firestore is `int64`.
-		pInt64, ok := p.(int64)
-		if !ok {
-			return []users{}, fmt.Errorf("failed to convert int64: %v", p)
-		}
-		result = append(result, users{UserId: doc.Ref.ID, Points: int(pInt64)})
-	}
-	return result, nil
-}
-
-func inquirePointTran(ctx context.Context, client *firestore.Client, start time.Time) (pointTrans map[string]pointTran, sortedkeys []string, err error) {
+func handleShowGoodpointHistory(ctx context.Context, client *firestore.Client, start time.Time) (string, error) {
+	var bf bytes.Buffer
+	bf.WriteString("*****月間付与履歴*****\n")
+	// get pointTransactions from firestore
 	query := client.Collection("pointTransactions").Where("created_at", ">=", start).OrderBy("created_at", firestore.Desc)
 	iter := query.Documents(ctx)
-	result := map[string]pointTran{}
-	sortedKeys := []string{}
+
 	for {
 		doc, err := iter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return nil, nil, err
+			return "", err
 		}
 		var ptx pointTran
 		doc.DataTo(&ptx)
-		result[doc.Ref.ID] = ptx
-		sortedKeys = append(sortedKeys, doc.Ref.ID)
+		// add message
+		bf.WriteString(fmt.Sprintf("%s  <@%s>さんから<@%s>さんへ付与。『%v』 （付与ID = %s）\n",
+			toYyyymmdd(ptx.CreatedAt), ptx.SenderId, ptx.RecieverId, ptx.Reason, doc.Ref.ID))
 	}
-	return result, sortedKeys, nil
+	return bf.String(), nil
+}
+
+func handleShowRanking(ctx context.Context, client *firestore.Client, limit int) (string, error) {
+	// get users from firestore
+	query := client.Collection("users").OrderBy("points", firestore.Desc).Limit(limit)
+	iter := query.Documents(ctx)
+
+	var bf bytes.Buffer
+	bf.WriteString("ランキング結果発表！\n\n")
+
+	var i int
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		var user user
+		doc.DataTo(&user)
+		// add message
+		bf.WriteString(fmt.Sprintf("第%v位・・・<@%s>さん【獲得ポイント】%v pt \n", i+1, doc.Ref.ID, user.Points))
+		i++
+	}
+
+	bf.WriteString("\n\n")
+	bf.WriteString("いつもありがとうございます！皆さん拍手をお送りください👏👏")
+	return bf.String(), nil
 }
 
 func extractPointTransaction(slashCommand slack.SlashCommand) (pointTran, error) {
@@ -191,7 +265,7 @@ func extractPointTransaction(slashCommand slack.SlashCommand) (pointTran, error)
 	return pointTran{SenderId: slashCommand.UserID, RecieverId: recieverId, Reason: reason, Points: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()}, nil
 }
 
-func givePoint(ctx context.Context, client *firestore.Client, tran pointTran) error {
+func savePointTransaction(ctx context.Context, client *firestore.Client, tran pointTran) error {
 	tranMap, err := toMap(tran)
 	if err != nil {
 		return err
@@ -203,35 +277,43 @@ func givePoint(ctx context.Context, client *firestore.Client, tran pointTran) er
 	return nil
 }
 
-func saveUser(ctx context.Context, client *firestore.Client, userId string) error {
-	ref := client.Collection("users").Doc(userId)
-	dsnap, err := ref.Get(ctx)
-	point := 0
+func saveUserForGrant(ctx context.Context, client *firestore.Client, userId string) (points int, err error) {
+
+	// 合計ポイント更新のためトランザクションを制御する
+	totalPoints := 0
+	err = client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		ref := client.Collection("users").Doc(userId)
+		dsnap, err := tx.Get(ref)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				// 存在しない場合新規作成
+				totalPoints = 1
+				return createOrUpdateUser(ctx, ref, totalPoints)
+			} else {
+				return fmt.Errorf("failed to get user document: %v", err)
+			}
+		}
+		var user user
+		if err := dsnap.DataTo(&user); err != nil {
+			return err
+		}
+		totalPoints = user.Points + 1
+		return createOrUpdateUser(ctx, ref, totalPoints)
+	})
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
-			point = 1
-		} else {
-			return fmt.Errorf("failed to get user document: %v", err)
-		}
-	} else {
-		data := dsnap.Data()
-		p := data["points"]
-		// The type of the points retrieved from Firestore is `int64`.
-		pInt64, ok := p.(int64)
-		if !ok {
-			return fmt.Errorf("failed to convert int64: %v", p)
-		}
-		point = int(pInt64) + 1
+		return -1, err
 	}
-	if _, err = ref.Set(ctx, map[string]interface{}{
-		"points": point,
-	}, firestore.MergeAll); err != nil {
-		return err
-	}
-	return nil
+	return totalPoints, nil
 }
 
-// Conver a struct into map.
+func createOrUpdateUser(ctx context.Context, ref *firestore.DocumentRef, point int) error {
+	_, err := ref.Set(ctx, map[string]interface{}{
+		"points": point,
+	}, firestore.MergeAll)
+	return err
+}
+
+// Convert a struct into map.
 func toMap(s interface{}) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	v := reflect.ValueOf(s)
@@ -274,7 +356,6 @@ type pointTran struct {
 	UpdatedAt  time.Time `firestore:"updated_at"`
 }
 
-type users struct {
-	UserId string
-	Points int
+type user struct {
+	Points int `firestore:"points"`
 }
